@@ -1,0 +1,104 @@
+---
+# Installs Plex Media Server on Alpine Linux using Docker,
+# with media mounted from a TrueNAS SMB share.
+# Run with:  ansible-playbook -i inventory.ini plex.yml -K
+
+- name: Install Plex on Alpine
+  hosts: plex
+  become: true
+
+  vars_prompt:
+    - name: smb_password
+      prompt: "TrueNAS SMB password for duncan"
+      private: true
+
+  vars:
+    plex_config_dir: /opt/plex/config
+    plex_media_dir: /srv/media
+    plex_timezone: America/Chicago
+    plex_uid: 1000
+    plex_gid: 1000
+    plex_claim: ""
+
+    nas_host: 192.168.0.XXX     # TrueNAS IP (Alpine can't resolve .local names)
+    nas_share: plex
+    smb_user: duncan
+
+  tasks:
+    - name: Install Docker, Docker SDK and SMB tools
+      community.general.apk:
+        name:
+          - docker
+          - py3-docker-py
+          - cifs-utils
+        state: present
+        update_cache: true
+
+    - name: Create Plex config and media directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ plex_uid }}"
+        group: "{{ plex_gid }}"
+        mode: "0755"
+      loop:
+        - "{{ plex_config_dir }}"
+        - "{{ plex_media_dir }}"
+
+    - name: Save SMB credentials (root-only)
+      ansible.builtin.copy:
+        dest: /etc/smb-plex.cred
+        content: |
+          username={{ smb_user }}
+          password={{ smb_password }}
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Mount the TrueNAS share now and on every boot
+      ansible.posix.mount:
+        path: "{{ plex_media_dir }}"
+        src: "//{{ nas_host }}/{{ nas_share }}"
+        fstype: cifs
+        opts: "credentials=/etc/smb-plex.cred,uid={{ plex_uid }},gid={{ plex_gid }},iocharset=utf8,vers=3.0,ro,_netdev"
+        state: mounted
+
+    - name: Mount network shares at boot (OpenRC netmount)
+      ansible.builtin.service:
+        name: netmount
+        enabled: true
+
+    - name: Make Docker wait for the network share at boot
+      ansible.builtin.lineinfile:
+        path: /etc/conf.d/docker
+        line: 'rc_need="netmount"'
+        create: true
+
+    - name: Enable and start Docker
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Run the Plex container
+      community.docker.docker_container:
+        name: plex
+        image: lscr.io/linuxserver/plex:latest
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        pull: true
+        env:
+          PUID: "{{ plex_uid | string }}"
+          PGID: "{{ plex_gid | string }}"
+          TZ: "{{ plex_timezone }}"
+          VERSION: docker
+          PLEX_CLAIM: "{{ plex_claim }}"
+        volumes:
+          - "{{ plex_config_dir }}:/config"
+          - "{{ plex_media_dir }}:/media"
+
+    - name: Show where to finish setup
+      ansible.builtin.debug:
+        msg: "Plex is starting. Open http://<your-alpine-ip>:32400/web — your TrueNAS media is at /media inside Plex."
